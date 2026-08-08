@@ -1,9 +1,0 @@
-README.md
-pyproject.toml
-src/kitchensense/main.py
-src/kitchensense.egg-info/PKG-INFO
-src/kitchensense.egg-info/SOURCES.txt
-src/kitchensense.egg-info/dependency_links.txt
-src/kitchensense.egg-info/requires.txt
-src/kitchensense.egg-info/top_level.txt
-tests/test_health.py
