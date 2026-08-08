@@ -83,7 +83,7 @@ def ensure_graphviz() -> None:
 
 
 ensure_graphviz()
-from graphviz import Digraph  # noqa: E402
+from graphviz import Digraph
 
 OUT = Path("diagrams")
 OUT.mkdir(exist_ok=True)
