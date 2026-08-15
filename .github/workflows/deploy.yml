@@ -1,8 +1,12 @@
 name: Deploy
 
 on:
-  push:
+  # Deploys are gated on CI. GitHub fires workflow_run for every CI outcome, so
+  # the job below has to check the conclusion itself — see its `if`.
+  workflow_run:
+    workflows: [CI]
     branches: [main]
+    types: [completed]
   workflow_dispatch:
 
 env:
@@ -23,8 +27,19 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # A failed, cancelled, or skipped CI run stops here. workflow_dispatch carries no
+    # workflow_run payload, so it is allowed through explicitly.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    env:
+      # A workflow_run event runs against the default branch tip, and github.sha points
+      # there rather than at the commit CI just passed on. Deploy the tested commit.
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Sign in to Azure
         uses: azure/login@v2
@@ -50,7 +65,7 @@ jobs:
           # This workflow owns the image name outright — infra/main.bicep no longer
           # names an image, it reads back whatever is running. The container app name is
           # deliberately not reused as the repository name here.
-          echo "image=$LOGIN_SERVER/kitchensense:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image=$LOGIN_SERVER/kitchensense:${DEPLOY_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Sign in to the registry
         run: az acr login --name "${{ steps.registry.outputs.name }}"
@@ -74,4 +89,4 @@ jobs:
             --resource-group "$RESOURCE_GROUP" \
             --query properties.configuration.ingress.fqdn \
             --output tsv)
-          echo "Deployed ${GITHUB_SHA::7} to https://$FQDN" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deployed ${DEPLOY_SHA::7} to https://$FQDN" >> "$GITHUB_STEP_SUMMARY"
