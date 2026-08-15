@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | Container Registry | `acrkitchensense<hash>` | Basic SKU, admin user disabled |
 | Key Vault | `kv-ks-<hash>` | RBAC authorisation, soft delete with 90 day retention |
+| PostgreSQL flexible server | `psql-kitchensense-<hash>` | Burstable B1ms, PostgreSQL 16, 32GB, public access |
 | Managed identity | `id-kitchensense-<env>` | user-assigned; the identity the container app runs as |
 | Log Analytics workspace | `log-kitchensense-<env>` | 30 day retention |
 | Container Apps environment | `cae-kitchensense-<env>` | logs go to the workspace above |
@@ -31,6 +32,59 @@ is derived from the resource group ID.
 
 The deploy workflow only builds and rolls out images. Infrastructure changes are applied
 by running the deployment command below.
+
+## The database
+
+`postgresAdminPassword` is a required parameter with no default — a template cannot
+invent a password, and any default would be a shared credential in source control. **Every
+deployment must pass it**, including the `what-if` in step 1 below, and passing the same
+value again is a no-op. Avoid `: / ? # [ ] @` in it: the connection string is a URI, and
+those characters would be read as delimiters.
+
+The connection string is written to the vault as **`postgres-connection-string`**. Nothing
+extra was needed to let the app read it — the container app's identity already holds Key
+Vault Secrets User on the whole vault, which covers every secret in it. Note that the
+deploying principal needs `Microsoft.KeyVault/vaults/secrets/write`, which is a
+control-plane permission: Contributor on the resource group has it, and the data-plane
+**Key Vault Secrets Officer** role does not.
+
+Two firewall rules. `AllowAllAzureServices` is the `0.0.0.0`–`0.0.0.0` sentinel behind the
+portal's "allow Azure services" checkbox; it is what lets the container app connect, since
+a Container Apps environment with no dedicated VNet has no stable outbound IP to name
+instead. It is broader than the name suggests — it admits Azure resources in *any*
+subscription, not just this one, so the database's own credentials are what actually
+protect it. The second rule is optional and off by default:
+
+```bash
+--parameters clientIpAddress=$(curl -s ifconfig.me)
+```
+
+`azure.extensions` is set to `VECTOR`, which allow-lists the extension at the server. That
+is only half of it — the extension still has to be created inside the database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+### There is no auto-stop
+
+This was asked for and does not exist. Azure Database for PostgreSQL flexible server has
+no idle auto-stop or auto-pause — that is an Azure SQL serverless feature, and it has no
+PostgreSQL equivalent on any tier. `az postgres flexible-server` offers only a manual
+`stop`, which takes no arguments beyond the server name, and a stopped server **restarts
+itself automatically after 7 days** whether or not anyone asks.
+
+Stopping by hand is the whole of what is available:
+
+```bash
+az postgres flexible-server stop --name <server> --resource-group rg-kitchensense
+az postgres flexible-server start --name <server> --resource-group rg-kitchensense
+```
+
+Note that stopping suspends compute billing but **not storage** — the 32GB is charged
+either way. To approximate the intent, run the `stop` above on a schedule (a cron'd
+GitHub Actions job, or an Azure Automation runbook) and accept the weekly auto-restart.
+Nothing in this template does that today.
 
 ## Who owns the running image
 
@@ -82,13 +136,16 @@ does not exist yet, so it is created first and the template adopts it.
 Its name is derived from the resource group ID, so read the name the template will use
 rather than choosing one. `what-if` evaluates the template without deploying anything;
 `containerImage` is only supplied here because the template refuses to be evaluated
-without it.
+without it, and `postgresAdminPassword` because it has no default. Use the real password
+here — what-if runs the same validation a deployment does, so a throwaway that fails the
+complexity rules fails the command.
 
 ```bash
 REGISTRY=$(az deployment group what-if \
   --resource-group rg-kitchensense \
   --template-file infra/main.bicep \
   --parameters environmentName=production containerAppExists=false containerImage=none \
+    postgresAdminPassword="$PGPASSWORD" \
   --no-pretty-print \
   --query "changes[?contains(resourceId, 'Microsoft.ContainerRegistry/registries')].after.name | [0]" \
   --output tsv)
@@ -119,14 +176,16 @@ az deployment group create \
   --resource-group rg-kitchensense \
   --template-file infra/main.bicep \
   --parameters environmentName=production containerAppExists=false \
-    containerImage="$REGISTRY.azurecr.io/kitchensense:bootstrap"
+    containerImage="$REGISTRY.azurecr.io/kitchensense:bootstrap" \
+    postgresAdminPassword="$PGPASSWORD"
 ```
 
-Both parameters belong to this first deployment only: `containerAppExists=false` says
-there is no running image to preserve yet, and `containerImage` supplies what to start on
-instead. Every later deployment is run without either, and leaves the running image
-alone — the deploy workflow replaces the bootstrap image on its first run. See [Who owns
-the running image](#who-owns-the-running-image) above.
+Two of those parameters belong to this first deployment only: `containerAppExists=false`
+says there is no running image to preserve yet, and `containerImage` supplies what to
+start on instead. Every later deployment is run without either, and leaves the running
+image alone — the deploy workflow replaces the bootstrap image on its first run. See [Who
+owns the running image](#who-owns-the-running-image) above. `postgresAdminPassword` is the
+exception: it is required on **every** deployment, first or not.
 
 Note the outputs — `registryLoginServer` and `containerAppFqdn` are useful for
 verification.
@@ -228,6 +287,7 @@ REGISTRY=$(az deployment group what-if \
   --resource-group rg-kitchensense-staging \
   --template-file infra/main.bicep \
   --parameters environmentName=staging containerAppExists=false containerImage=none \
+    postgresAdminPassword="$PGPASSWORD" \
   --no-pretty-print \
   --query "changes[?contains(resourceId, 'Microsoft.ContainerRegistry/registries')].after.name | [0]" \
   --output tsv)
@@ -242,7 +302,8 @@ az deployment group create \
   --resource-group rg-kitchensense-staging \
   --template-file infra/main.bicep \
   --parameters environmentName=staging containerAppExists=false \
-    containerImage="$REGISTRY.azurecr.io/kitchensense:bootstrap"
+    containerImage="$REGISTRY.azurecr.io/kitchensense:bootstrap" \
+    postgresAdminPassword="$PGPASSWORD"
 ```
 
 Staging needs its own federated credential subject (for whichever branch or GitHub
