@@ -47,8 +47,9 @@ jobs:
           fi
           echo "login_server=$LOGIN_SERVER" >> "$GITHUB_OUTPUT"
           echo "name=${LOGIN_SERVER%%.*}" >> "$GITHUB_OUTPUT"
-          # The repository name is literal so it matches the containerImage default in
-          # infra/main.bicep; the container app name is deliberately not reused here.
+          # This workflow owns the image name outright — infra/main.bicep no longer
+          # names an image, it reads back whatever is running. The container app name is
+          # deliberately not reused as the repository name here.
           echo "image=$LOGIN_SERVER/kitchensense:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Sign in to the registry

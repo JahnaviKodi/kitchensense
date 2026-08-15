@@ -5,12 +5,23 @@
 | Resource | Name | Notes |
 | --- | --- | --- |
 | Container Registry | `acrkitchensense<hash>` | Basic SKU, admin user disabled |
+| Key Vault | `kv-ks-<hash>` | RBAC authorisation, soft delete with 90 day retention |
+| Managed identity | `id-kitchensense-<env>` | user-assigned; the identity the container app runs as |
 | Log Analytics workspace | `log-kitchensense-<env>` | 30 day retention |
 | Container Apps environment | `cae-kitchensense-<env>` | logs go to the workspace above |
 | Container App | `kitchensense-api` | external ingress on 8000, 0–2 replicas, 0.25 CPU / 0.5Gi |
 
-The container app runs under a system-assigned managed identity that holds **AcrPull**
-on the registry, so no registry password exists anywhere.
+The container app runs under a user-assigned managed identity that holds **AcrPull** on
+the registry and **Key Vault Secrets User** on the vault, so no registry password exists
+anywhere and secrets are read at runtime rather than stored in the template.
+
+The identity is user-assigned rather than system-assigned deliberately. A system-assigned
+principal does not exist until its resource has been created, which means its role
+assignments can only be created *after* the container app — leaving a window where the
+app tries to pull its image before AcrPull has propagated, and the deployment fails. A
+user-assigned identity exists on its own, so both role assignments are created first and
+the container app declares `dependsOn` on them. Purge protection is deliberately left off
+so a torn-down staging vault's name can be reused.
 
 The `environmentName` parameter (`staging` or `production`) is what lets both
 environments share this file. **Each environment gets its own resource group** —
@@ -21,6 +32,40 @@ is derived from the resource group ID.
 The deploy workflow only builds and rolls out images. Infrastructure changes are applied
 by running the deployment command below.
 
+## Who owns the running image
+
+The deploy workflow does, and a Bicep deployment must never take it back. Because ARM
+rewrites every property it is given, a template that names an image would reset a
+SHA-tagged build to whatever the template said — which is exactly how a deployment once
+rolled production back to `kitchensense:v1`.
+
+So `containerImage` is empty by default and the image is read back from the running app
+instead. `current-image.bicep` is a one-resource module that does nothing but look the
+app up and output the image it is running; `main.bicep` feeds that straight back into the
+container. The lookup has to sit in its own module: an `existing` reference in
+`main.bicep` compiles to a `reference()` on the very container app that file deploys, and
+ARM rejects a resource that references itself as a circular dependency.
+
+That leaves one thing the template cannot work out for itself — whether the app is there
+to be read. `containerAppExists` answers it, and defaults to `true` so the routine case
+needs no thought and no flag. **The first deployment into an empty resource group must
+pass `containerAppExists=false`**; forget it and the deployment fails with
+`ResourceNotFound` rather than quietly rolling the image back.
+
+A first deployment must also pass `containerImage`, because there is no running image to
+keep and the template will not invent one. Deploying with neither fails straight away
+with an error naming both parameters. That refusal is deliberate: the obvious placeholder,
+`mcr.microsoft.com/k8se/quickstart`, listens on port 80 while ingress and both health
+probes here target 8000, so the revision never becomes healthy and the deployment burns
+its entire timeout before failing with `Operation expired` — the same slow, unreadable
+failure this environment has already hit once. A refusal that names the missing parameter
+is the same problem reported in a second instead of an hour. [Bootstrapping a new
+environment](#1-bootstrap-the-registry) covers how to get that first image built when the
+registry does not exist yet.
+
+`containerImage` stays available for pinning and rollback: passing it overrides the
+lookup, and the `containerAppImage` output reports what was actually deployed.
+
 ---
 
 ## One-time setup
@@ -28,25 +73,65 @@ by running the deployment command below.
 Everything here is done once per environment, by someone with permission to create app
 registrations and assign roles.
 
-### 1. Deploy the infrastructure
+### 1. Bootstrap the registry
+
+The container app has to start on a real image — one that answers `/health` on port 8000,
+which no public placeholder does. That image has to live in the registry, and the registry
+does not exist yet, so it is created first and the template adopts it.
+
+Its name is derived from the resource group ID, so read the name the template will use
+rather than choosing one. `what-if` evaluates the template without deploying anything;
+`containerImage` is only supplied here because the template refuses to be evaluated
+without it.
+
+```bash
+REGISTRY=$(az deployment group what-if \
+  --resource-group rg-kitchensense \
+  --template-file infra/main.bicep \
+  --parameters environmentName=production containerAppExists=false containerImage=none \
+  --no-pretty-print \
+  --query "changes[?contains(resourceId, 'Microsoft.ContainerRegistry/registries')].after.name | [0]" \
+  --output tsv)
+
+az acr create --name "$REGISTRY" --resource-group rg-kitchensense --sku Basic
+
+az acr login --name "$REGISTRY"
+docker build --tag "$REGISTRY.azurecr.io/kitchensense:bootstrap" .
+docker push "$REGISTRY.azurecr.io/kitchensense:bootstrap"
+```
+
+The build runs locally, so **Docker must be running on the machine you run this from**.
+The obvious alternative, `az acr build`, builds inside ACR and needs no local Docker, but
+it goes through ACR Tasks — which this subscription cannot use, and the command fails with
+`TasksOperationsNotAllowed`. Building locally and pushing is the same end result: the
+registry ends up holding `kitchensense:bootstrap` built from the `Dockerfile` in the
+repository root. `az acr login` authenticates with the Azure CLI's own credentials, so the
+registry's admin user stays disabled. This mirrors what `deploy.yml` does on every run.
+
+Do not pass `registryName` to the deployment below to use some other
+name: later deployments run without it and would fall back to the derived name, leaving
+the app pointed at a second, empty registry.
+
+### 2. Deploy the infrastructure
 
 ```bash
 az deployment group create \
   --resource-group rg-kitchensense \
   --template-file infra/main.bicep \
-  --parameters environmentName=production
+  --parameters environmentName=production containerAppExists=false \
+    containerImage="$REGISTRY.azurecr.io/kitchensense:bootstrap"
 ```
 
-The first deployment starts the container app on a public placeholder image
-(`mcr.microsoft.com/k8se/quickstart`), because the registry has no image yet. The first
-run of the deploy workflow replaces it with a real SHA-tagged build. Later deployments
-of the Bicep file leave the running image alone unless you pass `containerImage`
-yourself.
+Both parameters belong to this first deployment only: `containerAppExists=false` says
+there is no running image to preserve yet, and `containerImage` supplies what to start on
+instead. Every later deployment is run without either, and leaves the running image
+alone — the deploy workflow replaces the bootstrap image on its first run. See [Who owns
+the running image](#who-owns-the-running-image) above.
 
 Note the outputs — `registryLoginServer` and `containerAppFqdn` are useful for
 verification.
 
-### 2. Create the app registration GitHub will sign in as
+### 3. Create the app registration GitHub will sign in as
 
 ```bash
 az ad app create --display-name kitchensense-deploy
@@ -54,7 +139,7 @@ APP_ID=$(az ad app list --display-name kitchensense-deploy --query "[0].appId" -
 az ad sp create --id "$APP_ID"
 ```
 
-### 3. Register the federated credential
+### 4. Register the federated credential
 
 This is what replaces a client secret: GitHub presents a short-lived OIDC token, and
 Azure trusts it only for the exact repository, branch and workflow trigger described
@@ -77,7 +162,7 @@ trigger for pull requests or tags, add a second credential — one per subject:
 - tags → `repo:<owner>/<repo>:ref:refs/tags/v1.0.0`
 - GitHub Environments → `repo:<owner>/<repo>:environment:production`
 
-### 4. Give the service principal access
+### 5. Give the service principal access
 
 ```bash
 SUB_ID=$(az account show --query id -o tsv)
@@ -97,7 +182,7 @@ az role assignment create \
   --scope "$ACR_ID"
 ```
 
-### 5. Add the GitHub secrets
+### 6. Add the GitHub secrets
 
 In the repository, under **Settings → Secrets and variables → Actions**, add three
 repository secrets. **There is no client secret** — the federated credential is the
@@ -112,7 +197,7 @@ whole authentication story.
 These are identifiers rather than credentials, but keeping them as secrets avoids
 publishing the tenant layout in logs.
 
-### 6. Check it works
+### 7. Check it works
 
 Push to `main` (or run the workflow manually from the Actions tab) and confirm:
 
@@ -133,14 +218,31 @@ container app points at exactly one build, and rolling back is a matter of point
 
 ## Staging
 
-Create the resource group, then deploy the same file with a different parameter:
+Create the resource group, then run steps 1 and 2 against it with a different
+`environmentName`. Staging has its own registry, so it needs its own bootstrap image too:
 
 ```bash
 az group create --name rg-kitchensense-staging --location uksouth
+
+REGISTRY=$(az deployment group what-if \
+  --resource-group rg-kitchensense-staging \
+  --template-file infra/main.bicep \
+  --parameters environmentName=staging containerAppExists=false containerImage=none \
+  --no-pretty-print \
+  --query "changes[?contains(resourceId, 'Microsoft.ContainerRegistry/registries')].after.name | [0]" \
+  --output tsv)
+
+az acr create --name "$REGISTRY" --resource-group rg-kitchensense-staging --sku Basic
+
+az acr login --name "$REGISTRY"
+docker build --tag "$REGISTRY.azurecr.io/kitchensense:bootstrap" .
+docker push "$REGISTRY.azurecr.io/kitchensense:bootstrap"
+
 az deployment group create \
   --resource-group rg-kitchensense-staging \
   --template-file infra/main.bicep \
-  --parameters environmentName=staging
+  --parameters environmentName=staging containerAppExists=false \
+    containerImage="$REGISTRY.azurecr.io/kitchensense:bootstrap"
 ```
 
 Staging needs its own federated credential subject (for whichever branch or GitHub
