@@ -7,7 +7,9 @@ dependencies = [
   "fastapi",
   "uvicorn[standard]",
   "pydantic>=2",
-  "sqlalchemy>=2",
+  # 2.0.28 introduced postgresql_nulls_not_distinct, which the snapshot's lot
+  # key needs because printed_date is legitimately NULL.
+  "sqlalchemy>=2.0.30",
   "asyncpg",
   "alembic",
 ]
@@ -19,6 +21,11 @@ dev = [
   "httpx",
   "ruff",
   "mypy",
+  "hypothesis",
+  "testcontainers[postgres]",
+  # Only for the container's readiness probe and Alembic's sync paths;
+  # the application itself talks asyncpg.
+  "psycopg[binary]",
 ]
 
 [build-system]
@@ -31,6 +38,9 @@ packages = ["src/kitchensense"]
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 testpaths = ["tests"]
+markers = [
+  "postgres: needs a real Postgres, started via testcontainers (skipped without Docker)",
+]
 
 [tool.ruff]
 line-length = 100
@@ -39,6 +49,12 @@ exclude = ["docs", ".venv"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+# `alembic/` at the repository root makes ruff read the installed `alembic`
+# package as first-party, which shuffles migration imports on every run.
+known-third-party = ["alembic"]
+combine-as-imports = true
 
 [tool.mypy]
 python_version = "3.12"
