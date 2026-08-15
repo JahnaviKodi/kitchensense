@@ -1,0 +1,76 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  RESOURCE_GROUP: rg-kitchensense
+  ENVIRONMENT_NAME: production
+  CONTAINER_APP: kitchensense-api
+
+# Never let two deploys race to update the same container app.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  # Required for the OIDC token exchange with Azure. No client secret is stored.
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sign in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve the container registry
+        id: registry
+        run: |
+          LOGIN_SERVER=$(az acr list \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "[?tags.environment=='$ENVIRONMENT_NAME'] | [0].loginServer" \
+            --output tsv)
+          if [ -z "$LOGIN_SERVER" ]; then
+            echo "No registry tagged environment=$ENVIRONMENT_NAME in $RESOURCE_GROUP." >&2
+            echo "Deploy infra/main.bicep first — see infra/README.md." >&2
+            exit 1
+          fi
+          echo "login_server=$LOGIN_SERVER" >> "$GITHUB_OUTPUT"
+          echo "name=${LOGIN_SERVER%%.*}" >> "$GITHUB_OUTPUT"
+          # The repository name is literal so it matches the containerImage default in
+          # infra/main.bicep; the container app name is deliberately not reused here.
+          echo "image=$LOGIN_SERVER/kitchensense:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Sign in to the registry
+        run: az acr login --name "${{ steps.registry.outputs.name }}"
+
+      - name: Build and push the image
+        run: |
+          docker build --tag "${{ steps.registry.outputs.image }}" .
+          docker push "${{ steps.registry.outputs.image }}"
+
+      - name: Update the container app
+        run: |
+          az containerapp update \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "${{ steps.registry.outputs.image }}"
+
+      - name: Report the deployed URL
+        run: |
+          FQDN=$(az containerapp show \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+          echo "Deployed ${GITHUB_SHA::7} to https://$FQDN" >> "$GITHUB_STEP_SUMMARY"
