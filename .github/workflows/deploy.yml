@@ -135,12 +135,20 @@ jobs:
           esac
 
           RULE="gh-deploy-${{ github.run_id }}"
+          # Recorded before the rule is created, not after. If `create` fails
+          # halfway — or the step is cancelled between the API call and the next
+          # line — the close step still knows what to look for. The cost is that
+          # it may look for a rule that was never made, which it handles.
           echo "server=$SERVER" >> "$GITHUB_OUTPUT"
           echo "rule=$RULE" >> "$GITHUB_OUTPUT"
+
+          # Mind the flags: under `firewall-rule`, --server-name is the server and
+          # --name is the *rule*. At the server level (`show`, `start` above) --name
+          # is the server. There is no --rule-name.
           az postgres flexible-server firewall-rule create \
             --resource-group "$RESOURCE_GROUP" \
-            --name "$SERVER" \
-            --rule-name "$RULE" \
+            --server-name "$SERVER" \
+            --name "$RULE" \
             --start-ip-address "$RUNNER_IP" \
             --end-ip-address "$RUNNER_IP" \
             --output none
@@ -182,16 +190,48 @@ jobs:
 
       # The rule is scoped to one run id and is useless afterwards, so it goes even when
       # the migration failed — the point of the `always()` is that a broken deploy does
-      # not leave the database open to a recycled runner address.
+      # not leave the database open to a recycled runner address. `always()` also covers
+      # a cancelled run, which a bare `if: failure() || success()` would not.
+      #
+      # It does not cover the runner disappearing mid-job; nothing in a workflow can. The
+      # rule name carries the run id so anything left behind that way is identifiable:
+      #   az postgres flexible-server firewall-rule list -g rg-kitchensense -s <server>
       - name: Close the database firewall
         if: always() && steps.firewall.outputs.rule != ''
         run: |
-          az postgres flexible-server firewall-rule delete \
+          SERVER="${{ steps.firewall.outputs.server }}"
+          RULE="${{ steps.firewall.outputs.rule }}"
+
+          if az postgres flexible-server firewall-rule delete \
             --resource-group "$RESOURCE_GROUP" \
-            --name "${{ steps.firewall.outputs.server }}" \
-            --rule-name "${{ steps.firewall.outputs.rule }}" \
+            --server-name "$SERVER" \
+            --name "$RULE" \
             --yes \
-            --output none
+            --output none; then
+            echo "Closed firewall rule $RULE on $SERVER."
+            exit 0
+          fi
+
+          # The delete failed. The outputs are written before the rule is created, so one
+          # possibility is that it never existed — a `create` that failed on a bad address.
+          # The other is that the rule is sitting there open, which is the whole thing this
+          # step exists to prevent. Those must not be confused, so the step passes only on
+          # a positive confirmation that the rule is absent: a `list` that succeeds and
+          # does not contain it. A `list` that itself fails is inconclusive, and
+          # inconclusive is treated as still-open.
+          REMAINING=$(az postgres flexible-server firewall-rule list \
+            --resource-group "$RESOURCE_GROUP" \
+            --server-name "$SERVER" \
+            --query "length([?name=='$RULE'])" \
+            --output tsv) || REMAINING=""
+
+          if [ "$REMAINING" = "0" ]; then
+            echo "Firewall rule $RULE was never created on $SERVER; nothing to close."
+            exit 0
+          fi
+
+          echo "::error::Firewall rule $RULE may still be open on $SERVER. Remove it: az postgres flexible-server firewall-rule delete -g $RESOURCE_GROUP -s $SERVER -n $RULE --yes"
+          exit 1
 
       - name: Update the container app
         run: |
