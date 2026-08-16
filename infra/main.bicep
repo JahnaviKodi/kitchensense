@@ -319,6 +319,9 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   // Neither role assignment is referenced from inside this resource, so Bicep cannot
   // infer the ordering. Without this the app is created in parallel with them and can
   // attempt its first image pull before AcrPull has propagated.
+  // The secret is not listed here: the container's POSTGRES_SECRET_NAME
+  // variable reads postgresConnectionStringSecret.name, so Bicep infers that
+  // ordering on its own, and stating it again is a linter warning.
   dependsOn: [
     acrPull
     keyVaultSecretsUser
@@ -360,10 +363,31 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: json('0.25')
             memory: '0.5Gi'
           }
+          // The connection string itself is deliberately not here. It is read
+          // at runtime from the vault below, using the managed identity, so
+          // the database password never enters the template, the container
+          // definition, the deployment history or `az containerapp show`.
           env: [
             {
               name: 'APP_ENV'
               value: environmentName
+            }
+            {
+              name: 'KEY_VAULT_URI'
+              value: keyVault.properties.vaultUri
+            }
+            // Which identity to authenticate as. Required: this is a
+            // user-assigned identity, and a credential given no client id
+            // looks for a system-assigned one, which this app does not have.
+            // Taken from the identity resource rather than hardcoded, so
+            // staging authenticates as staging's identity.
+            {
+              name: 'AZURE_CLIENT_ID'
+              value: appIdentity.properties.clientId
+            }
+            {
+              name: 'POSTGRES_SECRET_NAME'
+              value: postgresConnectionStringSecret.name
             }
           ]
           probes: [

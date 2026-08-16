@@ -3,6 +3,11 @@ services:
     build: .
     ports: ["8000:8000"]
     depends_on: [db]
+    environment:
+      # Set locally, unset in Azure. Its presence is what tells the app to skip
+      # Key Vault entirely, so no managed identity is needed to run this.
+      DATABASE_URL: postgresql://postgres:local@db:5432/kitchensense
+      APP_ENV: local
   db:
     image: postgres:16
     environment:

@@ -27,12 +27,31 @@ from typing import TypeVar
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from kitchensense.db import provider
 from kitchensense.db.session import create_engine
 from kitchensense.models import CanonicalProduct, Household
 
 ROOT = Path(__file__).resolve().parents[1]
 
 T = TypeVar("T")
+
+
+@pytest.fixture(autouse=True)
+def _no_key_vault_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing in this suite talks to Azure.
+
+    Without this, any test that reaches ``/health/deep`` with no
+    ``DATABASE_URL`` set makes a real HTTPS request to the production vault
+    and waits for it to fail — a network dependency in a unit test, and a slow
+    one on a CI runner with no managed identity to present. Tests that mean to
+    exercise the Key Vault path patch this again themselves; a later
+    ``monkeypatch.setattr`` on the same target wins.
+    """
+
+    def _refuse(_: object) -> str:
+        raise RuntimeError("Key Vault is not reachable from the test suite")
+
+    monkeypatch.setattr(provider, "_read_secret", _refuse)
 
 
 @pytest.fixture(scope="session")

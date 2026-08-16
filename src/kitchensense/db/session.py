@@ -11,6 +11,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -20,21 +21,58 @@ from sqlalchemy.ext.asyncio import (
 
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:local@localhost:5432/kitchensense"
 
+SYNC_DRIVER_NAMES = {"postgres", "postgresql"}
 
-def database_url() -> str:
-    """The configured database URL, normalised onto the asyncpg driver.
 
-    Azure and docker-compose both hand us a plain ``postgresql://`` URL, which
-    SQLAlchemy would otherwise resolve to the synchronous psycopg driver.
+def normalize_database_url(url: str) -> str:
+    """Put a Postgres URL from anywhere onto the driver this app speaks.
+
+    Two rewrites, both of which are failures in production if skipped.
+
+    The driver: Azure, docker-compose and psql all produce plain
+    ``postgresql://``, which SQLAlchemy resolves to the *synchronous* psycopg
+    driver and then refuses to use from an async engine.
+
+    ``sslmode``: SQLAlchemy's asyncpg dialect forwards unrecognised query
+    parameters straight into ``asyncpg.connect()``, and asyncpg has no
+    ``sslmode`` argument — it spells the same thing ``ssl``, accepting the
+    identical set of values. Azure's connection string ends in
+    ``?sslmode=require``, so leaving it alone turns every connection into a
+    ``TypeError`` that only ever appears against a real Azure database.
+    """
+    parsed = make_url(url.strip())
+    if parsed.drivername in SYNC_DRIVER_NAMES:
+        parsed = parsed.set(drivername="postgresql+asyncpg")
+
+    query = dict(parsed.query)
+    sslmode = query.pop("sslmode", None)
+    if sslmode is not None and "ssl" not in query:
+        query["ssl"] = sslmode
+    parsed = parsed.set(query=query)
+
+    # str() on a URL masks the password with "***", which authenticates
+    # against nothing.
+    return parsed.render_as_string(hide_password=False)
+
+
+def configured_database_url() -> str | None:
+    """The URL from the environment, or ``None`` if none is set.
+
+    ``None`` is meaningful: it is what tells the provider to go and ask Key
+    Vault instead.
     """
     url = os.environ.get("KITCHENSENSE_DATABASE_URL") or os.environ.get("DATABASE_URL")
-    if not url:
-        return DEFAULT_DATABASE_URL
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+asyncpg://", 1)
-    return url
+    if not url or not url.strip():
+        return None
+    return normalize_database_url(url)
+
+
+def database_url() -> str:
+    """The configured URL, falling back to a local docker-compose database.
+
+    Used by Alembic, which always needs *some* URL to talk to.
+    """
+    return configured_database_url() or DEFAULT_DATABASE_URL
 
 
 def create_engine(url: str | None = None, *, echo: bool = False) -> AsyncEngine:

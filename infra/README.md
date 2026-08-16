@@ -48,6 +48,32 @@ deploying principal needs `Microsoft.KeyVault/vaults/secrets/write`, which is a
 control-plane permission: Contributor on the resource group has it, and the data-plane
 **Key Vault Secrets Officer** role does not.
 
+### How the app finds it
+
+Three environment variables on the container, all derived from resources in this template
+rather than hardcoded, so staging reads staging's vault as staging's identity:
+
+| Variable | Value |
+| --- | --- |
+| `KEY_VAULT_URI` | `keyVault.properties.vaultUri` |
+| `AZURE_CLIENT_ID` | `appIdentity.properties.clientId` |
+| `POSTGRES_SECRET_NAME` | `postgres-connection-string` |
+
+`AZURE_CLIENT_ID` is not optional. The identity is *user-assigned*, and a credential given
+no client id looks for a system-assigned one, which this app does not have.
+
+The connection string itself is deliberately absent from the container definition. Putting
+it there would place the database password in the template, in the deployment history and
+in the output of `az containerapp show` — all readable by anyone with resource-group read
+access. The app fetches it at runtime instead.
+
+The fetch is best-effort at startup and lazy thereafter, which is what lets the container
+start while the PostgreSQL server is stopped. A vault that is briefly unreachable, or a
+role assignment that has not propagated, produces a warning in the startup logs and a
+`not_configured` on `/health/deep` — not a container that will not start. Set
+`DATABASE_URL` on the container to bypass the vault entirely; its presence takes
+precedence.
+
 Two firewall rules. `AllowAllAzureServices` is the `0.0.0.0`–`0.0.0.0` sentinel behind the
 portal's "allow Azure services" checkbox; it is what lets the container app connect, since
 a Container Apps environment with no dedicated VNet has no stable outbound IP to name
@@ -85,6 +111,12 @@ Note that stopping suspends compute billing but **not storage** — the 32GB is 
 either way. To approximate the intent, run the `stop` above on a schedule (a cron'd
 GitHub Actions job, or an Azure Automation runbook) and accept the weekly auto-restart.
 Nothing in this template does that today.
+
+The application is built for this. It opens no connection at startup, so the container
+starts normally with the server stopped; `/health` — which both probes point at — never
+touches the database; and `/health/deep` reports `"database": "unreachable"` while still
+returning 200, so the app is not restarted over it. Only the endpoints that need rows
+fail, with a 503.
 
 ## Who owns the running image
 

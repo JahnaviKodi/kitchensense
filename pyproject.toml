@@ -12,6 +12,10 @@ dependencies = [
   "sqlalchemy>=2.0.30",
   "asyncpg",
   "alembic",
+  # Reading the PostgreSQL connection string from Key Vault with the
+  # container app's user-assigned managed identity.
+  "azure-identity",
+  "azure-keyvault-secrets",
 ]
 
 [project.optional-dependencies]
