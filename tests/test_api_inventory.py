@@ -19,7 +19,8 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kitchensense.api.dependencies import get_session
-from kitchensense.config import PLACEHOLDER_HOUSEHOLD_ID
+from kitchensense.api.security import get_verifier
+from kitchensense.auth.verifier import TokenVerifier
 from kitchensense.domain.inventory import (
     EventType,
     NewInventoryEvent,
@@ -27,26 +28,47 @@ from kitchensense.domain.inventory import (
 )
 from kitchensense.main import app
 from kitchensense.repositories import InventoryEventRepository
+from tests import identity
 from tests.conftest import Database, make_household, make_product
 
 pytestmark = pytest.mark.postgres
 
+DEFAULT_SUBJECT = "inventory-tests"
+
 
 @asynccontextmanager
-async def api(session: AsyncSession) -> AsyncIterator[AsyncClient]:
-    """The real app, wired to the test's transaction."""
+async def api(
+    session: AsyncSession, *, subject: str = DEFAULT_SUBJECT
+) -> AsyncIterator[AsyncClient]:
+    """The real app, wired to the test's transaction and a fake tenant.
+
+    Two overrides and no more. The session is swapped so the test's changes
+    can be rolled back, and the verifier is pointed at an in-memory tenant so
+    nothing reaches the network — but the token is real, and it is validated
+    by the real code, so authentication is exercised rather than bypassed.
+    Every client carries a bearer token by default; the tests that care about
+    its absence are in ``test_api_auth.py``.
+    """
 
     async def _session_override() -> AsyncIterator[AsyncSession]:
         yield session
 
+    stub = identity.TenantStub()
+    verifier = TokenVerifier(identity.settings(), transport=stub.transport)
+
     app.dependency_overrides[get_session] = _session_override
+    app.dependency_overrides[get_verifier] = lambda: verifier
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers=identity.bearer(identity.make_token(subject=subject)),
         ) as client:
             yield client
     finally:
         app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_verifier, None)
+        await verifier.aclose()
 
 
 def event_body(product_id: uuid.UUID, **overrides: object) -> dict[str, object]:
@@ -87,7 +109,7 @@ def test_appending_an_event_returns_it_with_both_clocks(db: Database) -> None:
 
         assert response.status_code == 201
         body = response.json()
-        assert body["household_id"] == str(PLACEHOLDER_HOUSEHOLD_ID)
+        assert body["household_id"] == str(identity.household_for(DEFAULT_SUBJECT))
         assert body["quantity_delta"] == "2.000"
         assert body["date_label_type"] == "use_by"
         assert body["metadata"] == {"receipt_line": "SEMI SKIM MLK 2L"}
@@ -228,7 +250,7 @@ def test_an_empty_kitchen_is_an_empty_snapshot(db: Database) -> None:
 
         assert response.status_code == 200
         body = response.json()
-        assert body["household_id"] == str(PLACEHOLDER_HOUSEHOLD_ID)
+        assert body["household_id"] == str(identity.household_for(DEFAULT_SUBJECT))
         assert body["lot_count"] == 0
         assert body["lots"] == []
 

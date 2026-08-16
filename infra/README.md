@@ -74,6 +74,37 @@ role assignment that has not propagated, produces a warning in the startup logs 
 `DATABASE_URL` on the container to bypass the vault entirely; its presence takes
 precedence.
 
+## Identity
+
+Three more environment variables, and unlike the vault and the registry these cannot be
+derived from anything this template deploys — they identify an Entra External ID tenant,
+which is a directory the API trusts rather than a resource here. They are parameters with
+defaults so a second environment can point at a different tenant without editing the file:
+
+| Variable | Parameter | Default |
+| --- | --- | --- |
+| `ENTRA_TENANT_ID` | `entraTenantId` | `14e3c719-bb1f-41cf-a75b-ba38e91e072d` |
+| `ENTRA_CLIENT_ID` | `entraClientId` | `87749dc2-96a6-4eb6-a811-02400be2309c` |
+| `ENTRA_AUDIENCE` | `entraAudience` | the client id |
+
+None of them is a secret. They are public identifiers, and the signing keys they lead to
+are public keys — the API never calls the tenant as a client, it only validates what
+callers present, so it has no client secret at all.
+
+The audience is separate from the client id because they are separate ideas. An API that
+later accepts tokens minted for an Application ID URI changes its audience without changing
+its identity.
+
+The application has **no defaults** for these. Unset, every protected endpoint answers 503
+and the startup log says so. A default would be a guess at which directory issues our
+tokens, and the wrong guess is a way of accepting the wrong ones.
+
+Note that External ID tenants live on `ciamlogin.com`, not the `login.microsoftonline.com`
+host a workforce tenant uses. The discovery URL is built from the tenant id and can be
+overridden with `ENTRA_OPENID_CONFIGURATION_URL` if a tenant is reachable some other way.
+
+## The database, continued
+
 Two firewall rules. `AllowAllAzureServices` is the `0.0.0.0`–`0.0.0.0` sentinel behind the
 portal's "allow Azure services" checkbox; it is what lets the container app connect, since
 a Container Apps environment with no dedicated VNet has no stable outbound IP to name
@@ -271,6 +302,16 @@ az role assignment create \
   --assignee-object-id "$SP_ID" --assignee-principal-type ServicePrincipal \
   --role AcrPush \
   --scope "$ACR_ID"
+
+# Read the connection string to migrate with. Contributor above is not enough: on an
+# RBAC-authorised vault it grants control-plane rights over the vault but no access to
+# the secret *values* inside it, so `az keyvault secret show` returns Forbidden without
+# this.
+KV_ID=$(az keyvault list -g rg-kitchensense --query "[0].id" -o tsv)
+az role assignment create \
+  --assignee-object-id "$SP_ID" --assignee-principal-type ServicePrincipal \
+  --role "Key Vault Secrets User" \
+  --scope "$KV_ID"
 ```
 
 ### 6. Add the GitHub secrets
@@ -306,6 +347,30 @@ resource group, so the generated registry name never has to be copied into the w
 Images are tagged with the full commit SHA — never `latest` — so every revision of the
 container app points at exactly one build, and rolling back is a matter of pointing
 `az containerapp update --image` at an older SHA.
+
+## Migrations
+
+`deploy.yml` runs `alembic upgrade head` against production after pushing the image and
+**before** updating the container app, so a failed migration aborts the deploy with the
+previous revision still serving. It reads `postgres-connection-string` from the vault with
+the same OIDC login the rest of the workflow uses, which is why the deploy principal needs
+Key Vault Secrets User in [step 5](#5-give-the-service-principal-access).
+
+Two consequences worth knowing before writing a migration:
+
+- **The old image runs against the new schema** for the minute or so between the migration
+  and the rollout. Widen in one deploy and narrow in a later one; a migration that drops or
+  renames a column the running revision still selects breaks production before the new
+  image is anywhere near it.
+- **A stopped server fails the deploy.** The job checks the server state first and fails
+  with the `start` command rather than hanging on a connection a stopped server accepts
+  and then drops. Deploying does not switch the database on by itself.
+
+The job opens a PostgreSQL firewall rule for the runner's own IP and deletes it in an
+`always()` step. GitHub-hosted runners do sit on Azure addresses, so the existing
+`AllowAllAzureServices` rule would most likely admit them and both steps could be dropped —
+but that is undocumented behaviour, and the day it changes it presents as a connection
+timeout in the middle of a deploy. The rule costs roughly a minute per run.
 
 ## Staging
 

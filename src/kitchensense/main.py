@@ -17,6 +17,8 @@ from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 
 from kitchensense.api import health, inventory
 from kitchensense.api.dependencies import ensure_database
+from kitchensense.api.security import ensure_verifier
+from kitchensense.auth.errors import AuthConfigurationError
 from kitchensense.config import Settings
 from kitchensense.db.provider import DatabaseUnavailableError
 
@@ -28,6 +30,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = Settings.from_env()
     app.state.settings = settings
     database = ensure_database(app)
+    verifier = ensure_verifier(app)
 
     # Best effort, and it never raises: this resolves the connection string so
     # a missing role assignment or a wrong vault URI shows up in the startup
@@ -35,10 +38,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # a stopped database does not affect it either way.
     await database.warm()
 
+    # Likewise loud but not fatal. A container that refused to start would
+    # crash-loop instead of serving /health, and the protected endpoints
+    # already fail closed with a 503 — nothing is reachable without a tenant
+    # to validate against.
+    try:
+        verifier.require_configured()
+        logger.info(
+            "Validating tokens for audience %s via %s",
+            settings.entra_audience,
+            settings.entra_openid_configuration_url,
+        )
+    except AuthConfigurationError as exc:
+        logger.error("%s; every protected endpoint will answer 503", exc)
+
     try:
         yield
     finally:
         await database.dispose()
+        await verifier.aclose()
 
 
 app = FastAPI(

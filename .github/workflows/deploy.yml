@@ -75,6 +75,124 @@ jobs:
           docker build --tag "${{ steps.registry.outputs.image }}" .
           docker push "${{ steps.registry.outputs.image }}"
 
+      # Migrations run against production between the push and the rollout, so a failed
+      # migration leaves an image in the registry that nothing is running yet — the app
+      # keeps serving the previous revision against the schema it was written for.
+      #
+      # The corollary is that every migration has to be readable by the *old* image for
+      # the length of this window. Widen first and narrow in a later deploy; a migration
+      # that drops or renames a column the running revision still selects will take
+      # production down before the new image is anywhere near it.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the application
+        run: pip install -e .
+
+      # A Container Apps environment with no dedicated VNet has no stable outbound IP, so
+      # the server's firewall carries the 0.0.0.0 "allow Azure services" rule for the app
+      # to connect through. GitHub-hosted runners happen to sit on Azure addresses too, so
+      # that rule would *probably* admit this job — but it is undocumented, varies by
+      # runner type, and would fail as a connection timeout on the day it changed. This
+      # opens a rule for the runner's own address instead and removes it below.
+      - name: Open the database firewall for this runner
+        id: firewall
+        run: |
+          SERVER=$(az postgres flexible-server list \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "[?tags.environment=='$ENVIRONMENT_NAME'] | [0].name" \
+            --output tsv)
+          if [ -z "$SERVER" ]; then
+            echo "No PostgreSQL server tagged environment=$ENVIRONMENT_NAME in $RESOURCE_GROUP." >&2
+            echo "Deploy infra/main.bicep first — see infra/README.md." >&2
+            exit 1
+          fi
+
+          # A stopped server accepts the TCP connection and then drops it, so without this
+          # check the migration below hangs until it times out and reports something that
+          # looks like a broken migration rather than a server that is switched off.
+          STATE=$(az postgres flexible-server show \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$SERVER" \
+            --query state \
+            --output tsv)
+          if [ "$STATE" != "Ready" ]; then
+            echo "PostgreSQL server $SERVER is '$STATE', not 'Ready'." >&2
+            echo "Start it and re-run this deployment:" >&2
+            echo "  az postgres flexible-server start --name $SERVER --resource-group $RESOURCE_GROUP" >&2
+            exit 1
+          fi
+
+          RUNNER_IP=$(curl -sf --max-time 10 https://api.ipify.org)
+          case "$RUNNER_IP" in
+            *.*.*.*) ;;
+            *)
+              echo "Could not determine this runner's public IP (got '$RUNNER_IP')." >&2
+              exit 1
+              ;;
+          esac
+
+          RULE="gh-deploy-${{ github.run_id }}"
+          echo "server=$SERVER" >> "$GITHUB_OUTPUT"
+          echo "rule=$RULE" >> "$GITHUB_OUTPUT"
+          az postgres flexible-server firewall-rule create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$SERVER" \
+            --rule-name "$RULE" \
+            --start-ip-address "$RUNNER_IP" \
+            --end-ip-address "$RUNNER_IP" \
+            --output none
+
+      # Fetching the secret and using it live in the same step on purpose: the connection
+      # string carries the database admin password, and putting it in $GITHUB_ENV would
+      # leave it readable by every step that follows, this workflow's and any it calls.
+      - name: Run database migrations
+        run: |
+          VAULT=$(az keyvault list \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "[?tags.environment=='$ENVIRONMENT_NAME'] | [0].name" \
+            --output tsv)
+          if [ -z "$VAULT" ]; then
+            echo "No key vault tagged environment=$ENVIRONMENT_NAME in $RESOURCE_GROUP." >&2
+            exit 1
+          fi
+
+          DATABASE_URL=$(az keyvault secret show \
+            --vault-name "$VAULT" \
+            --name postgres-connection-string \
+            --query value \
+            --output tsv)
+          # An empty value here would not stop Alembic: database_url() falls back to the
+          # local docker-compose URL when DATABASE_URL is unset or blank, so the migration
+          # would report success against a database on the runner that nobody will ever
+          # read. Refuse instead.
+          if [ -z "$DATABASE_URL" ]; then
+            echo "Secret postgres-connection-string is empty in vault $VAULT." >&2
+            exit 1
+          fi
+          echo "::add-mask::$DATABASE_URL"
+          export DATABASE_URL
+
+          # env.py normalises this to postgresql+asyncpg and rewrites Azure's
+          # ?sslmode=require into the ?ssl= argument asyncpg understands, so the string
+          # goes in exactly as the vault stores it.
+          alembic upgrade head
+
+      # The rule is scoped to one run id and is useless afterwards, so it goes even when
+      # the migration failed — the point of the `always()` is that a broken deploy does
+      # not leave the database open to a recycled runner address.
+      - name: Close the database firewall
+        if: always() && steps.firewall.outputs.rule != ''
+        run: |
+          az postgres flexible-server firewall-rule delete \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "${{ steps.firewall.outputs.server }}" \
+            --rule-name "${{ steps.firewall.outputs.rule }}" \
+            --yes \
+            --output none
+
       - name: Update the container app
         run: |
           az containerapp update \

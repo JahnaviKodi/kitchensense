@@ -16,6 +16,12 @@ dependencies = [
   # container app's user-assigned managed identity.
   "azure-identity",
   "azure-keyvault-secrets",
+  # Validating Entra External ID access tokens. The crypto extra pulls in
+  # `cryptography`, without which PyJWT cannot verify an RS256 signature —
+  # and, worse, would not obviously fail to.
+  "pyjwt[crypto]>=2.9",
+  # Fetching the tenant's OpenID configuration and signing keys.
+  "httpx",
 ]
 
 [project.optional-dependencies]

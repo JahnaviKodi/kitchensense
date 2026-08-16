@@ -1,4 +1,9 @@
-"""Shared FastAPI dependencies: the database session and the household."""
+"""Shared FastAPI dependencies: the database session and the household.
+
+Authentication lives next door in ``security.py``; this module consumes the
+principal it produces and turns it into the tenancy argument every repository
+demands.
+"""
 
 from __future__ import annotations
 
@@ -10,8 +15,10 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from kitchensense.config import PLACEHOLDER_HOUSEHOLD_ID, Settings
+from kitchensense.api.security import PrincipalDep
+from kitchensense.config import Settings
 from kitchensense.db.provider import Database, DatabaseUnavailableError
+from kitchensense.repositories import HouseholdRepository
 
 __all__ = [
     "DatabaseDep",
@@ -81,19 +88,39 @@ async def get_session(database: DatabaseDep) -> AsyncIterator[AsyncSession]:
             raise
 
 
-def get_household_id() -> uuid.UUID:
-    """Which household this request is for.
-
-    TODO(auth): hardcoded. Once Entra External ID is wired up this reads the
-    household claim from the validated access token, and becomes the one place
-    tenancy is decided. Everything downstream already takes ``household_id``
-    as a required keyword argument, so only this function changes.
-    """
-    return PLACEHOLDER_HOUSEHOLD_ID
-
-
 # Annotated aliases rather than `= Depends(...)` defaults: the handlers read as
 # ordinary typed functions, and a parameter with no default cannot be called
 # with the dependency accidentally omitted.
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+
+async def get_household_id(principal: PrincipalDep, session: SessionDep) -> uuid.UUID:
+    """Which household this request is for. The single place tenancy is decided.
+
+    The id is derived from the validated token, never read from the request,
+    so there is no parameter a caller could supply to reach someone else's
+    kitchen. Everything downstream takes it as a required keyword argument.
+
+    ``principal`` is declared first on purpose. FastAPI resolves dependencies
+    in parameter order, so an unauthenticated request is refused before a
+    database session is opened — which matters out of hours, when opening one
+    fails: a caller with no token should be told that, not handed a 503 about
+    a database they were never going to be allowed to read.
+
+    The household row is created here, on first sight of a new subject. It is
+    committed immediately rather than left to the handler, because a read
+    endpoint never commits and the row would vanish with the transaction.
+    """
+    household_id = principal.household_id
+
+    created = await HouseholdRepository(session).ensure(
+        household_id=household_id, name=principal.household_name()
+    )
+    if created:
+        await session.commit()
+        logger.info("Created household %s on first sight of its subject", household_id)
+
+    return household_id
+
+
 HouseholdDep = Annotated[uuid.UUID, Depends(get_household_id)]

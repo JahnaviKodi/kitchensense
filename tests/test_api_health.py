@@ -16,8 +16,11 @@ from collections.abc import Iterator
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from kitchensense.api.security import get_verifier
+from kitchensense.auth.verifier import TokenVerifier
 from kitchensense.db import provider as provider_module
 from kitchensense.main import app, lifespan
+from tests import identity
 
 
 @pytest.fixture(autouse=True)
@@ -129,6 +132,27 @@ def test_deep_health_never_leaks_the_password(
     assert "hunter2" not in str(body)
 
 
+def _authenticated(_: pytest.MonkeyPatch) -> dict[str, str]:
+    """Get past the door, so the tests below are about the database.
+
+    A valid token is needed to reach any of this: authentication is checked
+    before the session is opened, so an unauthenticated request gets a 401 and
+    never finds out whether the database was up. That ordering has its own
+    test in ``test_api_auth.py``.
+    """
+    stub = identity.TenantStub()
+    app.dependency_overrides[get_verifier] = lambda: TokenVerifier(
+        identity.settings(), transport=stub.transport
+    )
+    return identity.bearer(identity.make_token())
+
+
+@pytest.fixture(autouse=True)
+def _clear_verifier_override() -> Iterator[None]:
+    yield
+    app.dependency_overrides.pop(get_verifier, None)
+
+
 @pytest.mark.parametrize(
     "path", ["/inventory", "/inventory/as-of?timestamp=2026-03-06T12:00:00Z"]
 )
@@ -137,8 +161,9 @@ def test_data_endpoints_answer_503_without_a_database(
 ) -> None:
     """Only the endpoints that need rows fail, and they fail legibly."""
     _no_vault(monkeypatch)
+    headers = _authenticated(monkeypatch)
 
-    status, body = asyncio.run(_get(path))
+    status, body = asyncio.run(_get(path, headers=headers))
 
     assert status == 503
     assert "database" in body["detail"].lower()  # type: ignore[union-attr]
@@ -148,6 +173,7 @@ def test_posting_an_event_answers_503_without_a_database(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _no_vault(monkeypatch)
+    headers = _authenticated(monkeypatch)
 
     async def scenario() -> tuple[int, dict[str, object]]:
         async with AsyncClient(
@@ -155,6 +181,7 @@ def test_posting_an_event_answers_503_without_a_database(
         ) as client:
             response = await client.post(
                 "/inventory/events",
+                headers=headers,
                 json={
                     "canonical_product_id": "00000000-0000-4000-8000-000000000001",
                     "event_type": "purchased",
@@ -185,12 +212,15 @@ def test_unavailability_is_reported_before_the_body_is_validated(
     been served regardless.
     """
     _no_vault(monkeypatch)
+    headers = _authenticated(monkeypatch)
 
     async def scenario() -> int:
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
-            response = await client.post("/inventory/events", json={"nonsense": True})
+            response = await client.post(
+                "/inventory/events", headers=headers, json={"nonsense": True}
+            )
         return response.status_code
 
     assert asyncio.run(scenario()) == 503

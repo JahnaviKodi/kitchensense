@@ -16,15 +16,23 @@ from typing import Any
 
 import pytest
 
-from kitchensense.repositories import inventory as inventory_repositories
+from kitchensense.repositories import (
+    household as household_repositories,
+    inventory as inventory_repositories,
+)
+from kitchensense.repositories.household import HouseholdRepository
 from kitchensense.repositories.inventory import (
     InventoryEventRepository,
     InventorySnapshotRepository,
 )
 
-REPOSITORIES = [InventoryEventRepository, InventorySnapshotRepository]
+REPOSITORIES = [
+    InventoryEventRepository,
+    InventorySnapshotRepository,
+    HouseholdRepository,
+]
 
-SOURCE = Path(inventory_repositories.__file__).read_text(encoding="utf-8")
+MODULES = [inventory_repositories, household_repositories]
 
 
 def public_methods(cls: type) -> list[tuple[str, Any]]:
@@ -82,14 +90,15 @@ def test_no_public_method_takes_positional_arguments(
     assert not positional, f"{cls.__name__}.{name} accepts {positional} positionally"
 
 
-def test_every_select_of_a_table_goes_through_the_scoping_helper() -> None:
+@pytest.mark.parametrize("module", MODULES, ids=lambda m: m.__name__.rsplit(".", 1)[-1])
+def test_every_select_of_a_table_goes_through_the_scoping_helper(module: Any) -> None:
     """The household filter cannot be forgotten if there is one place to put it.
 
     Requiring the argument only guarantees it was *passed*. This checks it is
     also *used*: no method builds its own ``select`` and quietly omits the
     predicate.
     """
-    tree = ast.parse(SOURCE)
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
     unscoped: list[str] = []
 
     for definition in ast.walk(tree):

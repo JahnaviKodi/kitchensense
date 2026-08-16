@@ -20,13 +20,13 @@ it still starts, and says so on `/health/deep`.
 
 ## API
 
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /inventory/events` | append an event to the kitchen record |
-| `GET /inventory` | the current snapshot |
-| `GET /inventory/as-of?timestamp=` | the snapshot at a past instant |
-| `GET /health` | liveness; never touches the database |
-| `GET /health/deep` | reports database reachability, always 200 |
+| Endpoint | Auth | Purpose |
+| --- | --- | --- |
+| `POST /inventory/events` | bearer | append an event to the kitchen record |
+| `GET /inventory` | bearer | the current snapshot |
+| `GET /inventory/as-of?timestamp=` | bearer | the snapshot at a past instant |
+| `GET /health` | open | liveness; never touches the database |
+| `GET /health/deep` | open | reports database reachability, always 200 |
 
 `POST /inventory/events` is idempotent on `idempotency_key`: replaying a
 request returns the original event with a 200 rather than a 201, so a retried
@@ -35,6 +35,27 @@ receipt upload is not a doubled purchase.
 `GET /inventory/as-of` answers *what the system knew then*, not what we now
 know was true then. An event that happened before the timestamp but was only
 reported afterwards is left out — see the kitchen record below.
+
+## Authentication
+
+The inventory endpoints require an Entra External ID access token carrying the
+`inventory.readwrite` scope. The signature, issuer, audience, expiry and
+not-before are all checked; the issuer and signing keys are discovered from the
+tenant's OpenID configuration and cached, refreshing when a token arrives
+signed by a key id we have not seen. Any failure is a 401 with a
+`WWW-Authenticate` challenge. `/health` and `/health/deep` are open, so the
+container's probes work whatever the tenant is doing.
+
+Three environment variables configure it, supplied by `infra/main.bicep`:
+`ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID` and `ENTRA_AUDIENCE`. **None has a
+default.** Unset, every protected endpoint answers 503 rather than the app
+guessing at which directory to trust.
+
+`household_id` is derived from the token's subject and the issuer, so there is
+no request field naming a household and nothing to tamper with. The household
+row is created the first time a subject is seen. This means **one household per
+user — a shared kitchen is not supported**; see
+[decision 004](docs/decisions/004-household-per-user.md).
 
 ## Project structure
 

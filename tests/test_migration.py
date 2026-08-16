@@ -10,6 +10,8 @@ later, on a table nobody has queried since.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 from alembic.autogenerate import compare_metadata
@@ -52,6 +54,127 @@ def test_the_migrated_schema_matches_the_models(
             return await connection.run_sync(_differences)
 
     assert loop.run_until_complete(scenario()) == []
+
+
+PLACEHOLDER_ID = "11111111-1111-4111-8111-111111111111"
+BEFORE_AUTH = "0002_placeholder_household"
+
+
+@contextmanager
+def scratch_database(
+    postgres_url: str, loop: asyncio.AbstractEventLoop, name: str
+) -> Iterator[str]:
+    """An empty database of its own, dropped afterwards."""
+    admin = create_engine(_url_for(postgres_url, "postgres"))
+
+    async def with_admin(statement: str) -> None:
+        async with admin.connect() as connection:
+            await connection.execution_options(isolation_level="AUTOCOMMIT")
+            await connection.execute(text(statement))
+
+    try:
+        loop.run_until_complete(with_admin(f'DROP DATABASE IF EXISTS "{name}"'))
+        loop.run_until_complete(with_admin(f'CREATE DATABASE "{name}"'))
+        yield _url_for(postgres_url, name)
+    finally:
+        loop.run_until_complete(
+            with_admin(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        )
+        loop.run_until_complete(admin.dispose())
+
+
+def _placeholder_exists(url: str, loop: asyncio.AbstractEventLoop) -> bool:
+    engine = create_engine(url)
+
+    async def scenario() -> bool:
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT count(*) FROM households "
+                        "WHERE id = CAST(:id AS uuid)"
+                    ),
+                    {"id": PLACEHOLDER_ID},
+                )
+                return bool(result.scalar_one())
+        finally:
+            await engine.dispose()
+
+    return loop.run_until_complete(scenario())
+
+
+def test_the_placeholder_household_is_removed_when_nothing_references_it(
+    postgres_url: str, loop: asyncio.AbstractEventLoop
+) -> None:
+    with scratch_database(postgres_url, loop, "placeholder_clean") as url:
+        run_migrations(url, revision=BEFORE_AUTH)
+        assert _placeholder_exists(url, loop) is True
+
+        run_migrations(url)
+
+        assert _placeholder_exists(url, loop) is False
+
+
+def test_the_placeholder_household_survives_if_events_reference_it(
+    postgres_url: str, loop: asyncio.AbstractEventLoop
+) -> None:
+    """The branch that would otherwise take a deploy down.
+
+    A deployment that ran the API before authentication existed has a real
+    kitchen record under the placeholder. Deleting the household would fail on
+    a RESTRICT foreign key, mid-migration, on a table this revision was never
+    meant to touch — so it warns and leaves the row instead. The row is
+    unreachable either way: no token derives that id.
+    """
+    with scratch_database(postgres_url, loop, "placeholder_in_use") as url:
+        run_migrations(url, revision=BEFORE_AUTH)
+        _seed_legacy_event(url, loop)
+
+        run_migrations(url)
+
+        assert _placeholder_exists(url, loop) is True
+
+
+def _seed_legacy_event(url: str, loop: asyncio.AbstractEventLoop) -> None:
+    """One event under the placeholder, as a pre-auth deployment would have."""
+    engine = create_engine(url)
+
+    async def scenario() -> None:
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO canonical_products (id, canonical_name, default_unit)
+                        VALUES (CAST(:id AS uuid), 'Legacy milk', 'l')
+                        """
+                    ),
+                    {"id": "22222222-2222-4222-8222-222222222222"},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO inventory_events (
+                            household_id, canonical_product_id, event_type,
+                            quantity_delta, unit, storage_location, occurred_at,
+                            source, idempotency_key
+                        )
+                        VALUES (
+                            CAST(:household AS uuid), CAST(:product AS uuid),
+                            'purchased', 1, 'l', 'fridge', now(),
+                            'receipt_ocr', 'legacy-1'
+                        )
+                        """
+                    ),
+                    {
+                        "household": PLACEHOLDER_ID,
+                        "product": "22222222-2222-4222-8222-222222222222",
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    loop.run_until_complete(scenario())
 
 
 def test_the_migration_can_be_undone_and_reapplied(

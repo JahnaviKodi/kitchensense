@@ -54,6 +54,23 @@ def _no_key_vault_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(provider, "_read_secret", _refuse)
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_tenant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nor does anything reach the real Entra tenant.
+
+    A verifier built from the environment would fetch the tenant's metadata
+    over the network. Cleared here so the suite behaves the same on a machine
+    where these happen to be exported as it does on a CI runner where they are
+    not — and so a test that forgets to override ``get_verifier`` fails with a
+    503 rather than quietly making an outbound request.
+
+    Tests that need a configured tenant build their Settings directly, through
+    ``tests.identity.settings``, and never read the environment.
+    """
+    for name in ("ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "ENTRA_AUDIENCE"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(scope="session")
 def loop() -> Iterator[asyncio.AbstractEventLoop]:
     """One event loop for the whole session, shared by every database test."""

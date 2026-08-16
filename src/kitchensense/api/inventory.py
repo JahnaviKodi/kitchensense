@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import AwareDatetime
 from sqlalchemy.exc import IntegrityError
 
@@ -20,13 +20,27 @@ from kitchensense.api.schemas import (
     InventoryEventResponse,
     SnapshotResponse,
 )
+from kitchensense.api.security import get_principal
 from kitchensense.repositories import (
     IdempotencyKeyConflictError,
     InventoryEventRepository,
     InventorySnapshotRepository,
 )
 
-router = APIRouter(prefix="/inventory", tags=["inventory"])
+router = APIRouter(
+    prefix="/inventory",
+    tags=["inventory"],
+    # Declared on the router rather than left to each handler's parameters.
+    # Router dependencies run before endpoint ones, so authentication is
+    # checked first structurally — not because of where a parameter happens to
+    # sit in a signature, and not something a new endpoint added here can
+    # forget to opt into.
+    dependencies=[Depends(get_principal)],
+    responses={
+        401: {"description": "No access token, or one that did not validate."},
+        503: {"description": "The database or the tenant configuration is unavailable."},
+    },
+)
 
 
 @router.post(

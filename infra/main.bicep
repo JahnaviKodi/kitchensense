@@ -69,6 +69,22 @@ param clientIpAddress string = ''
 @description('Days to retain data in the Log Analytics workspace.')
 param logRetentionInDays int = 30
 
+// Identity is a directory the API trusts, not a resource this template deploys, so unlike
+// the vault and the registry these cannot be derived — they are the External ID tenant's
+// own identifiers. They are parameters rather than literals in the container definition so
+// a second environment can point at a different tenant without editing the template.
+@description('Entra External ID tenant that issues access tokens for this API.')
+param entraTenantId string = '14e3c719-bb1f-41cf-a75b-ba38e91e072d'
+
+@description('Application (client) ID of the API\'s app registration in that tenant.')
+param entraClientId string = '87749dc2-96a6-4eb6-a811-02400be2309c'
+
+// Separate from the client id because they are separate ideas: the audience is what a
+// token must be addressed to, and an API that later accepts tokens minted for an
+// Application ID URI changes its audience without changing its identity.
+@description('Audience an access token must carry to be accepted. Defaults to the API client ID.')
+param entraAudience string = entraClientId
+
 var tags = {
   application: 'kitchensense'
   environment: environmentName
@@ -388,6 +404,26 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'POSTGRES_SECRET_NAME'
               value: postgresConnectionStringSecret.name
+            }
+            // Token validation. No secret among them: these are public
+            // identifiers, and the signing keys they lead to are public keys.
+            // The app has no client secret because it never calls the tenant
+            // as a client — it only validates what callers present.
+            //
+            // There is no default for any of these in the application. Unset,
+            // the API refuses every protected endpoint with a 503 rather than
+            // guessing at which directory it should trust.
+            {
+              name: 'ENTRA_TENANT_ID'
+              value: entraTenantId
+            }
+            {
+              name: 'ENTRA_CLIENT_ID'
+              value: entraClientId
+            }
+            {
+              name: 'ENTRA_AUDIENCE'
+              value: entraAudience
             }
           ]
           probes: [
