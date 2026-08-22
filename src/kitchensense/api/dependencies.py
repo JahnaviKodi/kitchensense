@@ -1,4 +1,4 @@
-"""Shared FastAPI dependencies: the database session and the household.
+"""Shared FastAPI dependencies: the database session, the household, the blob store.
 
 Authentication lives next door in ``security.py``; this module consumes the
 principal it produces and turns it into the tenancy argument every repository
@@ -19,14 +19,18 @@ from kitchensense.api.security import PrincipalDep
 from kitchensense.config import Settings
 from kitchensense.db.provider import Database, DatabaseUnavailableError
 from kitchensense.repositories import HouseholdRepository
+from kitchensense.storage import ReceiptBlobStore
 
 __all__ = [
     "DatabaseDep",
     "HouseholdDep",
+    "ReceiptStoreDep",
     "SessionDep",
     "ensure_database",
+    "ensure_receipt_store",
     "get_database",
     "get_household_id",
+    "get_receipt_store",
     "get_session",
 ]
 
@@ -124,3 +128,25 @@ async def get_household_id(principal: PrincipalDep, session: SessionDep) -> uuid
 
 
 HouseholdDep = Annotated[uuid.UUID, Depends(get_household_id)]
+
+
+def ensure_receipt_store(app: FastAPI) -> ReceiptBlobStore:
+    """Attach the receipt blob store to the app, once.
+
+    Built on demand for the same reason the database handle and the verifier
+    are: a transport that skips the lifespan still has to find one.
+    Constructing it opens no connection and fetches no key — an unconfigured
+    deployment gets a store that refuses, not an error at startup.
+    """
+    store: ReceiptBlobStore | None = getattr(app.state, "receipt_store", None)
+    if store is None:
+        store = ReceiptBlobStore(Settings.from_env())
+        app.state.receipt_store = store
+    return store
+
+
+def get_receipt_store(request: Request) -> ReceiptBlobStore:
+    return ensure_receipt_store(request.app)
+
+
+ReceiptStoreDep = Annotated[ReceiptBlobStore, Depends(get_receipt_store)]

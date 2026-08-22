@@ -19,20 +19,23 @@ import pytest
 from kitchensense.repositories import (
     household as household_repositories,
     inventory as inventory_repositories,
+    receipts as receipt_repositories,
 )
 from kitchensense.repositories.household import HouseholdRepository
 from kitchensense.repositories.inventory import (
     InventoryEventRepository,
     InventorySnapshotRepository,
 )
+from kitchensense.repositories.receipts import ReceiptUploadRepository
 
 REPOSITORIES = [
     InventoryEventRepository,
     InventorySnapshotRepository,
     HouseholdRepository,
+    ReceiptUploadRepository,
 ]
 
-MODULES = [inventory_repositories, household_repositories]
+MODULES = [inventory_repositories, household_repositories, receipt_repositories]
 
 
 def public_methods(cls: type) -> list[tuple[str, Any]]:

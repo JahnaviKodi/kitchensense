@@ -15,12 +15,13 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 
-from kitchensense.api import health, inventory
-from kitchensense.api.dependencies import ensure_database
+from kitchensense.api import health, inventory, uploads
+from kitchensense.api.dependencies import ensure_database, ensure_receipt_store
 from kitchensense.api.security import ensure_verifier
 from kitchensense.auth.errors import AuthConfigurationError
 from kitchensense.config import Settings
 from kitchensense.db.provider import DatabaseUnavailableError
+from kitchensense.storage import StorageUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.settings = settings
     database = ensure_database(app)
     verifier = ensure_verifier(app)
+    receipts = ensure_receipt_store(app)
 
     # Best effort, and it never raises: this resolves the connection string so
     # a missing role assignment or a wrong vault URI shows up in the startup
@@ -51,6 +53,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     except AuthConfigurationError as exc:
         logger.error("%s; every protected endpoint will answer 503", exc)
+
+    # And likewise for storage: no account configured is a working API with
+    # one feature missing, not a container that should refuse to start. The
+    # key itself is not fetched here — it is fetched on the first upload, and
+    # cached from then on.
+    try:
+        receipts.require_configured()
+        logger.info(
+            "Receipt uploads go to container %r in %s",
+            settings.receipts_container,
+            settings.storage_blob_endpoint,
+        )
+    except StorageUnavailableError as exc:
+        logger.error("%s; /uploads will answer 503", exc)
 
     try:
         yield
@@ -95,5 +111,24 @@ async def _database_unreachable(request: Request, exc: DBAPIError) -> JSONRespon
     )
 
 
+@app.exception_handler(StorageUnavailableError)
+async def _storage_unavailable(
+    request: Request, exc: StorageUnavailableError
+) -> JSONResponse:
+    """No upload URL could be issued.
+
+    Either nothing is configured or the delegation key could not be fetched —
+    a missing role assignment, most likely, or one that has not propagated
+    yet. Both are ours to fix, so they are a 503 and the reason goes to the
+    logs rather than to the caller.
+    """
+    logger.warning("Could not issue an upload URL: %s", exc)
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": "Receipt uploads are unavailable. Please try again shortly."},
+    )
+
+
 app.include_router(health.router)
 app.include_router(inventory.router)
+app.include_router(uploads.router)

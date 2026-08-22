@@ -215,6 +215,7 @@ def test_the_migration_can_be_undone_and_reapplied(
             "canonical_products",
             "inventory_events",
             "inventory_snapshot",
+            "receipt_uploads",
         } <= after_upgrade
 
         run_migrations(scratch_url, revision="base")

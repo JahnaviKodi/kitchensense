@@ -24,6 +24,8 @@ PROTECTED = [
     ("GET", "/inventory"),
     ("GET", "/inventory/as-of?timestamp=2026-03-06T12:00:00Z"),
     ("POST", "/inventory/events"),
+    ("POST", "/uploads"),
+    ("POST", "/uploads/8f14e45f-ceea-4b3c-9c4e-1a2b3c4d5e6f/confirm"),
 ]
 
 

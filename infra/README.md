@@ -7,14 +7,23 @@
 | Container Registry | `acrkitchensense<hash>` | Basic SKU, admin user disabled |
 | Key Vault | `kv-ks-<hash>` | RBAC authorisation, soft delete with 90 day retention |
 | PostgreSQL flexible server | `psql-kitchensense-<hash>` | Burstable B1ms, PostgreSQL 16, 32GB, public access |
+| Storage account | `stks<hash>` | Standard_LRS, TLS 1.2 minimum, **shared key access disabled** |
+| Blob container | `receipts` | private; lifecycle rule deletes blobs after 30 days |
 | Managed identity | `id-kitchensense-<env>` | user-assigned; the identity the container app runs as |
 | Log Analytics workspace | `log-kitchensense-<env>` | 30 day retention |
 | Container Apps environment | `cae-kitchensense-<env>` | logs go to the workspace above |
 | Container App | `kitchensense-api` | external ingress on 8000, 0–2 replicas, 0.25 CPU / 0.5Gi |
 
 The container app runs under a user-assigned managed identity that holds **AcrPull** on
-the registry and **Key Vault Secrets User** on the vault, so no registry password exists
+the registry, **Key Vault Secrets User** on the vault and **Storage Blob Data
+Contributor** on the storage account, so no registry password and no storage key exists
 anywhere and secrets are read at runtime rather than stored in the template.
+
+The template grants **Key Vault Secrets User** on the same vault to one other principal:
+the service principal GitHub Actions signs in as, named by the `deployPrincipalId`
+parameter. The deploy workflow reads `postgres-connection-string` to run migrations, and
+that is a data-plane call the Contributor role does not cover. Pass an empty string to
+add no such assignment.
 
 The identity is user-assigned rather than system-assigned deliberately. A system-assigned
 principal does not exist until its resource has been created, which means its role
@@ -73,6 +82,53 @@ role assignment that has not propagated, produces a warning in the startup logs 
 `not_configured` on `/health/deep` — not a container that will not start. Set
 `DATABASE_URL` on the container to bypass the vault entirely; its presence takes
 precedence.
+
+## Receipt uploads
+
+Receipt images do not travel through the API. A client asks `POST /uploads` for
+permission, uploads the file straight to blob storage, and comes back to `POST
+/uploads/{id}/confirm`. The container app never buffers a photograph.
+
+The permission is a **user delegation SAS**: write-only, one named blob, five minutes.
+What makes it worth the extra moving parts is what it is *not* — the usual way to sign a
+SAS is with one of the account's two access keys, and an account key is a permanent,
+unscoped, unrevocable credential for the whole account. Here nothing reads a key:
+
+* The app asks storage for a *user delegation key*, authenticating as the managed
+  identity. That is what **Storage Blob Data Contributor** above is for, and it is
+  needed for both halves — a delegation SAS can grant no more than the identity signing
+  it already holds, so an identity without write access could sign a write SAS that
+  storage then refuses.
+* The key expires on its own, and revoking the role assignment invalidates every SAS
+  derived from it.
+* `allowSharedKeyAccess` is set to **false** on the account, so the account keys cannot
+  be used at all — by this app or by anything added to it later.
+
+The container is private (`publicAccess: 'None'`) and the account has
+`allowBlobPublicAccess: false`, which makes that true regardless of what any container's
+own setting says.
+
+One practical consequence of disabling shared key access: browsing the container in the
+portal, or with `az storage blob list`, no longer works with an account key — the portal
+defaults to key authentication and will report a failure that reads like a permissions
+bug. Switch its authentication method to **Microsoft Entra user account**, or pass
+`--auth-mode login` to the CLI, and give yourself the data-plane role:
+
+```bash
+STORAGE_ID=$(az storage account list -g rg-kitchensense --query "[0].id" -o tsv)
+az role assignment create   --assignee "$(az ad signed-in-user show --query id -o tsv)"   --role "Storage Blob Data Contributor"   --scope "$STORAGE_ID"
+```
+
+A lifecycle management policy deletes block blobs under the `receipts/` prefix
+`receiptRetentionInDays` (30) days after last modification. Receipt images are transient:
+they are read once by the extraction step, and what survives is the events they produced.
+The prefix filter is deliberate — a container added to this account later is not swept up
+by a policy written before it existed.
+
+The API is given the account **name**, as `STORAGE_ACCOUNT_NAME`, and builds the blob
+endpoint from it. There is no connection string and no key in the container definition.
+An unset name is not an error: the app starts, logs that uploads are unconfigured, and
+answers 503 from `/uploads` while everything else works.
 
 ## Identity
 
@@ -303,16 +359,47 @@ az role assignment create \
   --role AcrPush \
   --scope "$ACR_ID"
 
-# Read the connection string to migrate with. Contributor above is not enough: on an
-# RBAC-authorised vault it grants control-plane rights over the vault but no access to
-# the secret *values* inside it, so `az keyvault secret show` returns Forbidden without
-# this.
-KV_ID=$(az keyvault list -g rg-kitchensense --query "[0].id" -o tsv)
-az role assignment create \
-  --assignee-object-id "$SP_ID" --assignee-principal-type ServicePrincipal \
-  --role "Key Vault Secrets User" \
-  --scope "$KV_ID"
+echo "Deploy principal object id: $SP_ID"
 ```
+
+The third role this principal needs — **Key Vault Secrets User**, so the deploy workflow
+can read the connection string to migrate with — is *not* created here. `main.bicep`
+declares it, from the `deployPrincipalId` parameter. Keeping it in the template means it
+is reviewed with everything else and cannot drift out of a tenant nobody remembers
+granting.
+
+Note why it is needed at all: Contributor above is not enough. On an RBAC-authorised vault
+Contributor grants control-plane rights over the vault but no access to the secret
+*values* in it, so `az keyvault secret show` returns Forbidden without a data-plane role.
+
+`deployPrincipalId` is the **object id of the service principal**, not the app
+registration's client id. They are different GUIDs, and a role assignment accepts either
+before failing at deployment with `PrincipalNotFound`. `$SP_ID` above is the right one.
+
+### 5a. Re-deploy so the vault role assignment exists
+
+There is an ordering knot here: step 2 deploys the template, but the principal it grants
+access to is only created in step 3. On a **first** bootstrap into a tenant where that
+service principal does not exist yet, pass an empty id at step 2 to skip the assignment:
+
+```bash
+--parameters deployPrincipalId=''
+```
+
+then re-run the deployment once the principal exists:
+
+```bash
+az deployment group create \
+  --resource-group rg-kitchensense \
+  --template-file infra/main.bicep \
+  --parameters environmentName=production deployPrincipalId="$SP_ID" \
+    postgresAdminPassword="$PGPASSWORD"
+```
+
+For the existing production environment the default already names the right principal, so
+this is just a normal deployment. **The deploy workflow's migration step cannot read the
+secret until a template deployment has actually run** — the workflow only builds images
+and rolls them out; it never applies infrastructure.
 
 ### 6. Add the GitHub secrets
 

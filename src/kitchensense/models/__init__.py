@@ -13,6 +13,7 @@ from kitchensense.models.inventory_event import (
     InventoryEventRow,
 )
 from kitchensense.models.inventory_snapshot import InventorySnapshotRow
+from kitchensense.models.receipt_upload import ReceiptUploadRow
 
 __all__ = [
     "DATE_LABEL_TYPE_ENUM",
@@ -22,4 +23,5 @@ __all__ = [
     "Household",
     "InventoryEventRow",
     "InventorySnapshotRow",
+    "ReceiptUploadRow",
 ]

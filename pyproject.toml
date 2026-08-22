@@ -16,6 +16,11 @@ dependencies = [
   # container app's user-assigned managed identity.
   "azure-identity",
   "azure-keyvault-secrets",
+  # Receipt uploads. Used for two things only: asking storage for a user
+  # delegation key, and signing a SAS with it. The account key is never read —
+  # the account has key access disabled — so nothing here needs a credential
+  # beyond the managed identity.
+  "azure-storage-blob>=12.19",
   # Validating Entra External ID access tokens. The crypto extra pulls in
   # `cryptography`, without which PyJWT cannot verify an RS256 signature —
   # and, worse, would not obviously fail to.

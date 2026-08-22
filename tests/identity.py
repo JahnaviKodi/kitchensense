@@ -36,6 +36,10 @@ JWKS_URL = f"{ISSUER}/discovery/v2.0/keys"
 
 REQUIRED_SCOPE = "inventory.readwrite"
 
+STORAGE_ACCOUNT = "stkitchensensetest"
+BLOB_ENDPOINT = f"https://{STORAGE_ACCOUNT}.blob.core.windows.net"
+RECEIPTS_CONTAINER = "receipts"
+
 TENANT_KID = "test-signing-key"
 IMPOSTOR_KID = "impostor-key"
 
@@ -195,6 +199,16 @@ def settings(**overrides: Any) -> Settings:
         "jwks_min_refresh_seconds": 0.0,
         "token_leeway_seconds": 0.0,
         "identity_timeout_seconds": 10.0,
+        # A storage account that does not exist, which is fine: nothing in the
+        # suite reaches one. The delegation key is injected, and signing a SAS
+        # is local arithmetic over the account name.
+        "storage_account_name": STORAGE_ACCOUNT,
+        "storage_blob_endpoint": BLOB_ENDPOINT,
+        "receipts_container": RECEIPTS_CONTAINER,
+        "upload_sas_ttl_seconds": 300.0,
+        "delegation_key_ttl_seconds": 3600.0,
+        "storage_clock_skew_seconds": 300.0,
+        "storage_timeout_seconds": 10.0,
     }
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]

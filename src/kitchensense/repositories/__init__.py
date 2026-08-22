@@ -6,10 +6,12 @@ from kitchensense.repositories.inventory import (
     InventoryEventRepository,
     InventorySnapshotRepository,
 )
+from kitchensense.repositories.receipts import ReceiptUploadRepository
 
 __all__ = [
     "HouseholdRepository",
     "IdempotencyKeyConflictError",
     "InventoryEventRepository",
     "InventorySnapshotRepository",
+    "ReceiptUploadRepository",
 ]

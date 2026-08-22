@@ -30,6 +30,7 @@ from kitchensense.domain.inventory import (
     NewInventoryEvent,
     StorageLocation,
 )
+from kitchensense.domain.receipts import ReceiptContentType, ReceiptUpload
 
 __all__ = [
     "DeepHealthResponse",
@@ -39,6 +40,9 @@ __all__ = [
     "LotResponse",
     "RootResponse",
     "SnapshotResponse",
+    "UploadConfirmation",
+    "UploadRequest",
+    "UploadTicketResponse",
 ]
 
 # extra="forbid" is the strictness that matters most in a write API: a
@@ -246,6 +250,78 @@ class SnapshotResponse(BaseModel):
             as_of=snapshot.as_of,
             lot_count=len(snapshot.lots),
             lots=[LotResponse.from_domain(lot) for lot in snapshot.lots],
+        )
+
+
+class UploadRequest(BaseModel):
+    """What a client may say about a receipt it is about to upload.
+
+    Note how little that is. There is no filename, no path, no blob name and
+    no household — every one of those is decided by the server, and
+    ``extra="forbid"`` means a client that sends one anyway gets a 422 rather
+    than having it quietly ignored. That is deliberate: a field that is
+    ignored today is a field somebody wires up by accident in six months.
+    """
+
+    model_config = STRICT
+
+    # What the client intends to send, from a closed set. Recorded, and
+    # echoed back as the Content-Type header to use; it does not reach the
+    # blob name.
+    content_type: ReceiptContentType = ReceiptContentType.JPEG
+
+
+class UploadTicketResponse(BaseModel):
+    """Permission to upload one receipt, and the address to send it to.
+
+    ``upload_url`` carries the SAS token in its query string, so it is a
+    credential: it is write-only, it names one blob, and it stops working at
+    ``expires_at``. It is returned to the client that asked for it and is not
+    logged anywhere.
+    """
+
+    model_config = STRICT
+
+    upload_id: uuid.UUID
+    household_id: uuid.UUID
+    # Returned so a client can correlate, and so the confirm step has
+    # something to show a human when it goes wrong. Knowing the name grants
+    # nothing on its own — the container is private.
+    blob_name: str
+    content_type: ReceiptContentType
+    upload_url: str
+    method: str
+    # x-ms-blob-type, which Azure requires on the PUT and which a client has
+    # no way of guessing. Sent rather than documented.
+    headers: dict[str, str]
+    expires_at: datetime
+
+
+class UploadConfirmation(BaseModel):
+    """An upload the client has told us arrived."""
+
+    model_config = STRICT
+
+    upload_id: uuid.UUID
+    household_id: uuid.UUID
+    blob_name: str
+    content_type: str
+    requested_at: datetime
+    expires_at: datetime
+    confirmed_at: datetime
+
+    @classmethod
+    def from_domain(cls, upload: ReceiptUpload) -> Self:
+        if upload.confirmed_at is None:  # pragma: no cover - defensive
+            raise ValueError("an unconfirmed upload has no confirmation to report")
+        return cls(
+            upload_id=upload.id,
+            household_id=upload.household_id,
+            blob_name=upload.blob_name,
+            content_type=upload.content_type,
+            requested_at=upload.requested_at,
+            expires_at=upload.expires_at,
+            confirmed_at=upload.confirmed_at,
         )
 
 

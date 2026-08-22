@@ -31,6 +31,15 @@ DEFAULT_POSTGRES_SECRET_NAME = "postgres-connection-string"
 # in the app registration.
 DEFAULT_REQUIRED_SCOPE = "inventory.readwrite"
 
+# The container receipts are uploaded to, matching the one ``infra/main.bicep``
+# creates. Unlike the account name this can be defaulted: it is a name the
+# template and the application agree on, not one Azure hands out.
+DEFAULT_RECEIPTS_CONTAINER = "receipts"
+
+# Public suffix for the blob endpoint. A parameter only so a test — or a run
+# against Azurite — can point somewhere else without a real account.
+DEFAULT_BLOB_ENDPOINT_SUFFIX = "blob.core.windows.net"
+
 
 def _env(name: str, default: str = "") -> str:
     value = os.environ.get(name, "").strip()
@@ -75,9 +84,35 @@ class Settings:
     token_leeway_seconds: float
     identity_timeout_seconds: float
 
+    # --- receipt uploads ---
+    # No default, for the same reason the tenant has none: the account name is
+    # invented by ``uniqueString`` at deployment time, so there is no value
+    # that could stand in for it. Blank means uploads are not configured, and
+    # the endpoints answer 503 rather than signing URLs for an account that
+    # may belong to somebody else.
+    storage_account_name: str
+    storage_blob_endpoint: str
+    receipts_container: str
+    # How long an upload URL is good for. Short on purpose: the URL is a
+    # bearer credential for one blob, and the client already has it in hand
+    # when it is issued, so there is nothing to be gained by making it outlive
+    # the upload it was minted for.
+    upload_sas_ttl_seconds: float
+    # How long a user delegation key is kept and reused. Signing is local, so
+    # this is the only network call in the upload path; refetching one per
+    # request would put a round trip to Entra and storage in front of every
+    # receipt. Azure caps these at seven days.
+    delegation_key_ttl_seconds: float
+    # Clock skew allowance on the delegation key's start time, and on the
+    # SAS's. Storage rejects a start time in its own future, and the two
+    # clocks are not the same clock.
+    storage_clock_skew_seconds: float
+    storage_timeout_seconds: float
+
     @classmethod
     def from_env(cls) -> Settings:
         tenant_id = _env("ENTRA_TENANT_ID")
+        storage_account_name = _env("STORAGE_ACCOUNT_NAME")
         return cls(
             app_env=_env("APP_ENV", "local"),
             key_vault_uri=_env("KEY_VAULT_URI", DEFAULT_KEY_VAULT_URI),
@@ -107,6 +142,16 @@ class Settings:
             jwks_min_refresh_seconds=float(_env("JWKS_MIN_REFRESH_SECONDS", "60")),
             token_leeway_seconds=float(_env("TOKEN_LEEWAY_SECONDS", "60")),
             identity_timeout_seconds=float(_env("IDENTITY_TIMEOUT_SECONDS", "10")),
+            storage_account_name=storage_account_name,
+            storage_blob_endpoint=_env("STORAGE_BLOB_ENDPOINT")
+            or blob_endpoint_for(storage_account_name),
+            receipts_container=_env("RECEIPTS_CONTAINER", DEFAULT_RECEIPTS_CONTAINER),
+            upload_sas_ttl_seconds=float(_env("UPLOAD_SAS_TTL_SECONDS", "300")),
+            delegation_key_ttl_seconds=float(
+                _env("DELEGATION_KEY_TTL_SECONDS", "3600")
+            ),
+            storage_clock_skew_seconds=float(_env("STORAGE_CLOCK_SKEW_SECONDS", "300")),
+            storage_timeout_seconds=float(_env("STORAGE_TIMEOUT_SECONDS", "10")),
         )
 
 
@@ -128,3 +173,18 @@ def openid_configuration_url(tenant_id: str) -> str:
         f"https://{tenant_id}.ciamlogin.com/{tenant_id}/v2.0"
         "/.well-known/openid-configuration"
     )
+
+
+def blob_endpoint_for(
+    account_name: str, *, suffix: str = DEFAULT_BLOB_ENDPOINT_SUFFIX
+) -> str:
+    """Where an account's blobs live.
+
+    Returns an empty string for an empty account name, so an unconfigured
+    deployment fails the configuration check instead of signing URLs for
+    ``https://.blob.core.windows.net`` — which is not this account, and on a
+    bad day is somebody else's.
+    """
+    if not account_name:
+        return ""
+    return f"https://{account_name}.{suffix}"

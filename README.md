@@ -25,6 +25,8 @@ it still starts, and says so on `/health/deep`.
 | `POST /inventory/events` | bearer | append an event to the kitchen record |
 | `GET /inventory` | bearer | the current snapshot |
 | `GET /inventory/as-of?timestamp=` | bearer | the snapshot at a past instant |
+| `POST /uploads` | bearer | a five-minute, write-only URL for one receipt image |
+| `POST /uploads/{id}/confirm` | bearer | record that the upload finished |
 | `GET /health` | open | liveness; never touches the database |
 | `GET /health/deep` | open | reports database reachability, always 200 |
 
@@ -35,6 +37,27 @@ receipt upload is not a doubled purchase.
 `GET /inventory/as-of` answers *what the system knew then*, not what we now
 know was true then. An event that happened before the timestamp but was only
 reported afterwards is left out — see the kitchen record below.
+
+## Receipt uploads
+
+The image never passes through the API. `POST /uploads` returns a **user
+delegation SAS**: write-only, one blob, five minutes. The client PUTs the file
+straight to blob storage and then calls `POST /uploads/{id}/confirm`.
+
+The blob name is generated server-side from the household and a fresh id — the
+request body accepts a `content_type` and nothing else, and any other field is
+a 422. A row is written when the URL is issued, so a confirmation can be
+matched to a request that actually happened, and an upload that was promised
+and never delivered is a row that can be found rather than a blob nobody knows
+about.
+
+The SAS is signed with a key obtained over Entra using the container app's
+managed identity. **The storage account key is never read** — the account is
+deployed with shared key access disabled, so nothing could read one. See
+[decision 005](docs/decisions/005-receipt-upload-sas.md).
+
+Extraction of a confirmed receipt is not implemented yet: this is the upload
+path only.
 
 ## Authentication
 

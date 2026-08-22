@@ -34,6 +34,24 @@ param keyVaultName string = 'kv-ks-${uniqueString(resourceGroup().id)}'
 @maxValue(90)
 param keyVaultSoftDeleteRetentionInDays int = 90
 
+// Storage account names are globally unique, 3-24 characters, and allow lowercase
+// alphanumerics only — no hyphens, unlike every other name here. The prefix is kept to
+// four characters so the 13-character uniqueString fits.
+@description('Name of the storage account receipt images are uploaded to. Derived from the resource group and normally left at the default.')
+param storageAccountName string = 'stks${uniqueString(resourceGroup().id)}'
+
+@description('Blob container receipt uploads are written to.')
+param receiptsContainerName string = 'receipts'
+
+// Receipt images are transient. They are read once, by the extraction step, and what
+// matters afterwards is the events that came out of them — the picture of the receipt is
+// not the kitchen record. Keeping them longer would mean holding photographs of people's
+// shopping for no purpose anyone could name.
+@description('Days a receipt blob is kept before the lifecycle policy deletes it.')
+@minValue(1)
+@maxValue(365)
+param receiptRetentionInDays int = 30
+
 // PostgreSQL server names share a global DNS namespace, so the name is derived from the
 // resource group the same way the registry and vault names are.
 @description('Name of the PostgreSQL flexible server. Derived from the resource group and normally left at the default.')
@@ -65,6 +83,16 @@ param postgresStorageSizeGB int = 32
 // database directly: `--parameters clientIpAddress=$(curl -s ifconfig.me)`.
 @description('Single IPv4 address to open the PostgreSQL firewall for, typically your own. Leave empty to add no such rule.')
 param clientIpAddress string = ''
+
+// The object id of the *service principal*, not the app registration's client id. They
+// are different GUIDs and the role assignment silently accepts either, then fails at
+// deployment with PrincipalNotFound. Read it back with:
+//   az ad sp show --id <client-id> --query id -o tsv
+//
+// Left overridable, and skippable by passing an empty string, because staging is deployed
+// by its own service principal — see infra/README.md.
+@description('Object id of the service principal the deploy workflow signs in as. It is granted read access to secrets in the vault so migrations can fetch the connection string. Empty adds no such assignment.')
+param deployPrincipalId string = '6229d70b-e867-48da-ae06-8efe91789b32'
 
 @description('Days to retain data in the Log Analytics workspace.')
 param logRetentionInDays int = 30
@@ -124,6 +152,14 @@ var acrPullRoleDefinitionId = subscriptionResourceId(
 var keyVaultSecretsUserRoleDefinitionId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   '4633458b-17de-408a-b874-0445c86b69e6'
+)
+
+// Storage Blob Data Contributor. A *data plane* role: Contributor over the storage
+// account grants none of it. The API needs it for two things — asking for a user
+// delegation key, and having that key's SAS actually authorise a write.
+var storageBlobDataContributorRoleDefinitionId = subscriptionResourceId(
+  'Microsoft.Authorization/roleDefinitions',
+  'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
 )
 
 resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
@@ -191,6 +227,122 @@ resource keyVaultSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01
     principalId: appIdentity.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: keyVaultSecretsUserRoleDefinitionId
+  }
+}
+
+// The same read-only role, for the principal GitHub Actions signs in as. The deploy
+// workflow reads `postgres-connection-string` to run migrations, and that is a *data
+// plane* call: the vault has enableRbacAuthorization set, so Contributor on the resource
+// group does not grant it. Without this the workflow's `az keyvault secret show` fails
+// with Forbidden, having got far enough to look like a vault problem rather than a
+// missing role.
+//
+// Scoped to this vault, and read-only, so the deploy principal can fetch the connection
+// string and nothing else — it cannot write or delete a secret, here or anywhere.
+resource deployKeyVaultSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(deployPrincipalId)) {
+  name: guid(keyVault.id, deployPrincipalId, keyVaultSecretsUserRoleDefinitionId)
+  scope: keyVault
+  properties: {
+    principalId: deployPrincipalId
+    // Stated explicitly rather than left to ARM to infer. Without it, a freshly created
+    // principal that has not yet replicated across Entra fails the assignment with
+    // PrincipalNotFound; naming the type skips the lookup that races.
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: keyVaultSecretsUserRoleDefinitionId
+  }
+}
+
+resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
+  name: storageAccountName
+  location: location
+  tags: tags
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    minimumTlsVersion: 'TLS1_2'
+    supportsHttpsTrafficOnly: true
+    // No container in this account is ever meant to be readable without a credential,
+    // and this is the switch that makes that true regardless of what a container's own
+    // publicAccess setting says.
+    allowBlobPublicAccess: false
+    // The account keys are switched off entirely, not merely left unused. The API signs
+    // its upload URLs with a *user delegation* key — obtained over Entra with the
+    // container app's managed identity — so nothing in this system needs an account key,
+    // and a key that cannot be used is one that cannot be leaked, copied into a
+    // configuration file, or quietly reached for by the next thing that gets added here.
+    // User delegation SAS is unaffected by this: it is signed by Entra, not by a key.
+    allowSharedKeyAccess: false
+    accessTier: 'Hot'
+  }
+}
+
+resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
+  parent: storageAccount
+  name: 'default'
+}
+
+resource receiptsContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: receiptsContainerName
+  properties: {
+    // Private. Every read and every write is authorised — by the managed identity from
+    // inside, or by a short-lived user delegation SAS from a client.
+    publicAccess: 'None'
+  }
+}
+
+// One rule, one action: delete receipt blobs once they are old enough. The filter is
+// scoped by prefix to this container, so a container added later is not silently swept
+// up by a policy written before it existed.
+resource receiptsLifecycle 'Microsoft.Storage/storageAccounts/managementPolicies@2023-05-01' = {
+  parent: storageAccount
+  name: 'default'
+  properties: {
+    policy: {
+      rules: [
+        {
+          name: 'delete-receipts'
+          enabled: true
+          type: 'Lifecycle'
+          definition: {
+            filters: {
+              blobTypes: [
+                'blockBlob'
+              ]
+              prefixMatch: [
+                '${receiptsContainerName}/'
+              ]
+            }
+            actions: {
+              baseBlob: {
+                delete: {
+                  daysAfterModificationGreaterThan: receiptRetentionInDays
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    receiptsContainer
+  ]
+}
+
+// Lets the container app's identity request a user delegation key and write blobs. Note
+// that both halves of the upload flow need this one assignment: a user delegation SAS can
+// only grant permissions the delegating identity itself holds, so an identity with no
+// write access could sign a write SAS that storage then refuses.
+resource storageBlobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storageAccount.id, appIdentity.id, storageBlobDataContributorRoleDefinitionId)
+  scope: storageAccount
+  properties: {
+    principalId: appIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobDataContributorRoleDefinitionId
   }
 }
 
@@ -332,15 +484,19 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: containerAppName
   location: location
   tags: tags
-  // Neither role assignment is referenced from inside this resource, so Bicep cannot
-  // infer the ordering. Without this the app is created in parallel with them and can
-  // attempt its first image pull before AcrPull has propagated.
+  // None of these role assignments is referenced from inside this resource, so Bicep
+  // cannot infer the ordering. Without this the app is created in parallel with them and
+  // can attempt its first image pull before AcrPull has propagated — which is exactly how
+  // the original failed pull happened. Storage is listed for the same reason and not
+  // because the app needs blobs to start: it does not, but a replica that comes up before
+  // the assignment has propagated answers 503 from /uploads for as long as it takes.
   // The secret is not listed here: the container's POSTGRES_SECRET_NAME
   // variable reads postgresConnectionStringSecret.name, so Bicep infers that
   // ordering on its own, and stating it again is a linter warning.
   dependsOn: [
     acrPull
     keyVaultSecretsUser
+    storageBlobDataContributor
   ]
   identity: {
     type: 'UserAssigned'
@@ -404,6 +560,18 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'POSTGRES_SECRET_NAME'
               value: postgresConnectionStringSecret.name
+            }
+            // Where receipt images go. The account *name* is all the API is given: it
+            // builds the blob endpoint from it and authenticates with the identity
+            // above. There is no connection string and no account key here, because
+            // the account has key access switched off — see the storage account.
+            {
+              name: 'STORAGE_ACCOUNT_NAME'
+              value: storageAccount.name
+            }
+            {
+              name: 'RECEIPTS_CONTAINER'
+              value: receiptsContainer.name
             }
             // Token validation. No secret among them: these are public
             // identifiers, and the signing keys they lead to are public keys.
@@ -473,6 +641,9 @@ output postgresDatabaseName string = postgresDatabase.name
 // The name only. The connection string itself holds the admin password, and deployment
 // outputs are readable by anyone with read access to the deployment history.
 output postgresConnectionStringSecretName string = postgresConnectionStringSecret.name
+output storageAccountName string = storageAccount.name
+output receiptsContainerName string = receiptsContainer.name
+output receiptsRetentionInDays int = receiptRetentionInDays
 output containerAppName string = containerApp.name
 // Worth checking after an infrastructure deployment: it should be the SHA-tagged image
 // the app was already running.
